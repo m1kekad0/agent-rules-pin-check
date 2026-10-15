@@ -1,0 +1,15 @@
+{
+  "name": "agent-rules-pin-check",
+  "version": "0.1.0",
+  "description": "Verify vendored ai-agent-rules pins (PROVENANCE.md bytes/SHA256) in consumer repositories.",
+  "type": "module",
+  "license": "MIT",
+  "private": true,
+  "bin": { "agent-rules-pin-check": "bin/agent-rules-pin-check.mjs" },
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "lint": "node scripts/lint.mjs",
+    "test": "node --test",
+    "check:pin": "node bin/agent-rules-pin-check.mjs ."
+  }
+}
