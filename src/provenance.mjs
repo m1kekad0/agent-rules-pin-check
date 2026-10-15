@@ -1,6 +1,6 @@
 // Parse the metadata bullet list of a vendored ai-agent-rules PROVENANCE.md.
 const FIELDS = {
-  upstream: /^- Upstream URL:\s*(\S+)/m,
+  upstream: /^- Upstream(?: URL)?:[ \t]*(?:`([^\s`]+)`|([^\s`]+))/m,
   commit: /^- Commit:\s*`([0-9a-f]{40})`/m,
   path: /^- Path:\s*`([^`]+)`/m,
   bytes: /^- Bytes:\s*`(\d+)`/m,
@@ -15,7 +15,8 @@ export function parseProvenance(text) {
   for (const [key, re] of Object.entries(FIELDS)) {
     const m = text.match(re);
     if (!m) { missing.push(key); continue; }
-    out[key] = key.endsWith('ytes') ? Number(m[1]) : m[1];
+    const value = m[1] ?? m[2];
+    out[key] = key.endsWith('ytes') ? Number(value) : value;
   }
   return { fields: out, missing };
 }
