@@ -98,8 +98,9 @@ test('this repository pin is consistent', async () => {
 });
 
 const sink = () => ({ buf: '', write(s) { this.buf += s; } });
-const compare = (ahead_by = 0, files = []) => ({
-  ok: true, status: 200, json: async () => ({ ahead_by, files }),
+const compare = (ahead_by = 0, files = [], history = {}) => ({
+  ok: true, status: 200,
+  json: async () => ({ status: ahead_by > 0 ? 'ahead' : 'identical', behind_by: 0, ahead_by, files, ...history }),
 });
 
 test('default text and JSON stay unchanged and never call fetch', async () => {
@@ -158,6 +159,49 @@ test('ahead alone and file changes without ahead do not fail strict checks', asy
   }
 });
 
+test('non-forward histories are unverifiable even when only README.md is listed', async () => {
+  const dir = await fixture({ upstream: UPSTREAM });
+  for (const [status, ahead, behind_by] of [
+    ['diverged', 2, 1], ['behind', 0, 1], ['behind', 0, 0],
+    ['ahead', 2, 1], ['identical', 0, 1], ['unexpected', 0, 0], [undefined, 0, 0],
+  ]) {
+    const fetch = async () => compare(ahead, [{ filename: 'README.md' }], { status, behind_by });
+    for (const strict of [false, true]) {
+      for (const json of [false, true]) {
+        const out = sink();
+        const args = ['--upstream', ...(strict ? ['--fail-on-drift'] : []), ...(json ? ['--json'] : []), dir];
+        assert.equal(await main(args, out, { fetch }), strict ? 1 : 0);
+        if (json) {
+          const [r] = JSON.parse(out.buf);
+          assert.equal(r.ok, !strict);
+          assert.deepEqual(r.upstream, { status: 'unverifiable', reason: 'diverged' });
+        } else assert.ok(out.buf.includes('upstream: unverifiable (diverged)'));
+      }
+    }
+  }
+});
+
+test('compare file lists at or above 300 are unverifiable and fail strict checks', async () => {
+  const dir = await fixture({ upstream: UPSTREAM });
+  for (const length of [299, 300, 301]) {
+    const files = Array.from({ length }, (_, i) => ({ filename: `synthetic-${i}.md` }));
+    const fetch = async () => compare(1, files);
+    for (const strict of [false, true]) {
+      for (const json of [false, true]) {
+        const out = sink();
+        const args = ['--upstream', ...(strict ? ['--fail-on-drift'] : []), ...(json ? ['--json'] : []), dir];
+        assert.equal(await main(args, out, { fetch }), strict && length >= 300 ? 1 : 0);
+        if (json) {
+          const [r] = JSON.parse(out.buf);
+          assert.equal(r.ok, !(strict && length >= 300));
+          if (length >= 300) assert.deepEqual(r.upstream, { status: 'unverifiable', reason: 'file list limit' });
+          else assert.equal(r.upstream.status, 'verified');
+        } else if (length >= 300) assert.ok(out.buf.includes('upstream: unverifiable (file list limit)'));
+      }
+    }
+  }
+});
+
 test('renaming either tracked upstream file counts as a change', async () => {
   const r = await checkUpstream({ upstream: UPSTREAM, commit: COMMIT }, {
     fetch: async () => compare(1, [
@@ -208,7 +252,10 @@ test('GITHUB_TOKEN is sent in the header and never appears in text or JSON outpu
       if (outcome === 'network') throw new Error(`synthetic failure ${token}`);
       if (outcome === 'http') return { ok: false, status: 401, statusText: token, json: async () => ({ message: token }) };
       if (outcome === 'json') return { ok: true, json: async () => { throw new Error(token); } };
-      return { ok: true, json: async () => ({ ahead_by: 1, files: [{ filename: 'AGENTS.md', patch: token }], message: token }) };
+      return { ok: true, json: async () => ({
+        status: 'ahead', behind_by: 0, ahead_by: 1,
+        files: [{ filename: 'AGENTS.md', patch: token }], message: token,
+      }) };
     };
     for (const json of [false, true]) {
       const out = sink();
@@ -268,7 +315,9 @@ test('malformed and capped compare responses are unverifiable', async () => {
     [{ ahead_by: 1 }, 'invalid response'],
     [{ ahead_by: 1, files: [null] }, 'invalid response'],
     [{ ahead_by: 1, files: [{ filename: 'AGENTS.md', previous_filename: 123 }] }, 'invalid response'],
-    [{ ahead_by: 1, files: Array.from({ length: 300 }, (_, i) => ({ filename: `synthetic-${i}.md` })) }, 'file list limit'],
+    [{ status: 'ahead', behind_by: 0, ahead_by: 1,
+      files: Array.from({ length: 300 }, (_, i) => ({ filename: `synthetic-${i}.md` })),
+    }, 'file list limit'],
   ];
   for (const [body, reason] of cases) {
     const r = await checkUpstream({ upstream: UPSTREAM, commit: COMMIT }, {

@@ -38,6 +38,10 @@ export async function checkUpstream({ upstream, commit }, {
           (f.previous_filename === undefined || typeof f.previous_filename === 'string'))) {
       return unverifiable('invalid response');
     }
+    // Three-dot comparisons use the merge base, so only forward history is conclusive.
+    if ((data.status !== 'identical' && data.status !== 'ahead') || data.behind_by > 0) {
+      return unverifiable('diverged');
+    }
     // GitHub caps this list at 300; absence of a file at the cap is inconclusive.
     if (data.files.length >= 300) return unverifiable('file list limit');
     const changed = (name) => data.files.some((f) => f.filename === name || f.previous_filename === name);
