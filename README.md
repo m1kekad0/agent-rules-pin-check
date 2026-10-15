@@ -16,6 +16,29 @@ node bin/agent-rules-pin-check.mjs [--json] [--vendor-dir <path>] [dir ...]
 
 This repository checks its own pin in CI with `npm run check:pin`.
 
+## Use in a consumer repo / 消費側での利用
+
+After checking out the consumer repository and setting up Node.js 22+, add these steps to the same GitHub Actions job. Replace `<FULL_COMMIT_SHA>` with a reviewed full 40-character commit SHA of this tool. No `npm install` is needed.
+
+消費側リポジトリをチェックアウトし、Node.js 22 以降を準備した後、同じ GitHub Actions ジョブに以下を追加します。`<FULL_COMMIT_SHA>` は、このツールのレビュー済みの完全な 40 桁コミット SHA に置き換えてください。`npm install` は不要です。
+
+```yaml
+- name: Checkout pin checker
+  uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+  with:
+    repository: m1kekad0/agent-rules-pin-check
+    ref: <FULL_COMMIT_SHA>
+    path: .tools/agent-rules-pin-check
+    persist-credentials: false
+- name: Check consumer rules pin
+  working-directory: ${{ github.workspace }}
+  run: node .tools/agent-rules-pin-check/bin/agent-rules-pin-check.mjs .
+```
+
+The final `.` selects the consumer root, containing `vendor/ai-agent-rules/PROVENANCE.md`. See the [provenance format](docs/provenance-format.md) for the required fields.
+
+末尾の `.` は、`vendor/ai-agent-rules/PROVENANCE.md` がある消費側のルートを指定します。必須フィールドは [provenance の形式](docs/provenance-format.md) を参照してください。
+
 ## Development
 
 Requires Node.js 22+. `npm run lint`, `npm test`.
