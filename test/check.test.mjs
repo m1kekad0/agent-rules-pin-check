@@ -1,27 +1,46 @@
-import { test } from 'node:test';
+import { afterEach, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { checkRepo } from '../src/check.mjs';
 import { parseProvenance } from '../src/provenance.mjs';
 import { main } from '../bin/agent-rules-pin-check.mjs';
+import { checkUpstream } from '../src/upstream.mjs';
 
 const sha = (s) => createHash('sha256').update(s).digest('hex');
 const COMMIT = 'a'.repeat(40);
+const UPSTREAM = 'https://github.com/synthetic-owner/synthetic-rules';
+const fixtureDirs = [];
 
-async function fixture({ agents = 'synthetic rules\n', license = 'synthetic license\n', recordAgents, recordLicense } = {}) {
-  const dir = await mkdtemp(join(tmpdir(), 'pin-'));
-  const v = join(dir, 'vendor/ai-agent-rules');
+async function repoDir() {
+  const dir = await mkdtemp(join(process.cwd(), '.pin-test-'));
+  fixtureDirs.push(dir);
+  return dir;
+}
+
+// All tests stay offline, including those exercising the global fetch default.
+beforeEach((t) => {
+  t.mock.method(globalThis, 'fetch', async () => { throw new Error('Network disabled in tests'); });
+});
+afterEach(async () => {
+  await Promise.all(fixtureDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+});
+
+async function fixture({
+  agents = 'synthetic rules\n', license = 'synthetic license\n', recordAgents, recordLicense,
+  upstream = 'https://example.invalid/rules', commit = COMMIT, vendorDir = 'vendor/ai-agent-rules',
+} = {}) {
+  const dir = await repoDir();
+  const v = join(dir, vendorDir);
   await mkdir(v, { recursive: true });
   const ra = recordAgents ?? agents;
   const rl = recordLicense ?? license;
   await writeFile(join(v, 'AGENTS.md'), agents);
   await writeFile(join(v, 'LICENSE'), license);
   await writeFile(join(v, 'PROVENANCE.md'), [
-    '- Upstream URL: https://example.invalid/rules',
-    `- Commit: \`${COMMIT}\``,
+    `- Upstream URL: ${upstream}`,
+    `- Commit: \`${commit}\``,
     '- Path: `AGENTS.md`',
     `- Bytes: \`${Buffer.byteLength(ra)}\``,
     `- SHA256: \`${sha(ra)}\``,
@@ -58,7 +77,7 @@ test('modified LICENSE is reported', async () => {
 });
 
 test('missing provenance is reported', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'pin-'));
+  const dir = await repoDir();
   const r = await checkRepo(dir);
   assert.equal(r.ok, false);
 });
@@ -76,4 +95,221 @@ test('cli exit codes', async () => {
 test('this repository pin is consistent', async () => {
   const r = await checkRepo('.');
   assert.deepEqual(r.problems, []);
+});
+
+const sink = () => ({ buf: '', write(s) { this.buf += s; } });
+const compare = (ahead_by = 0, files = []) => ({
+  ok: true, status: 200, json: async () => ({ ahead_by, files }),
+});
+
+test('default text and JSON stay unchanged and never call fetch', async () => {
+  const dir = await fixture({ upstream: UPSTREAM });
+  const text = sink();
+  const json = sink();
+  assert.equal(await main([dir], text), 0);
+  assert.equal(text.buf, `OK   ${dir} @ ${COMMIT.slice(0, 12)}\n`);
+  assert.equal(await main(['--json', dir], json), 0);
+  assert.deepEqual(JSON.parse(json.buf), [{ dir, ok: true, commit: COMMIT, problems: [] }]);
+  assert.equal(globalThis.fetch.mock.callCount(), 0);
+});
+
+test('upstream uses global fetch with a GET to the parsed repository and pin', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => compare(3, [{ filename: 'AGENTS.md' }]));
+  const dir = await fixture({ upstream: UPSTREAM });
+  const out = sink();
+  assert.equal(await main(['--upstream', dir], out), 0);
+  assert.match(out.buf, /upstream: ahead_by=3, AGENTS\.md changed=true, LICENSE changed=false/);
+  assert.equal(globalThis.fetch.mock.callCount(), 1);
+  const [url, options] = globalThis.fetch.mock.calls[0].arguments;
+  assert.equal(url, `https://api.github.com/repos/synthetic-owner/synthetic-rules/compare/${COMMIT}...main`);
+  assert.equal(options.method, 'GET');
+  assert.equal(options.redirect, 'error');
+});
+
+test('drift is informational unless --fail-on-drift is set', async () => {
+  const dir = await fixture({ upstream: UPSTREAM });
+  for (const name of ['AGENTS.md', 'LICENSE']) {
+    const fetch = async () => compare(2, [{ filename: name }]);
+    for (const strict of [false, true]) {
+      const out = sink();
+      const args = ['--json', '--upstream', ...(strict ? ['--fail-on-drift'] : []), dir];
+      assert.equal(await main(args, out, { fetch }), strict ? 1 : 0);
+      const [r] = JSON.parse(out.buf);
+      assert.equal(r.ok, !strict);
+      assert.deepEqual(r.upstream, {
+        status: 'verified', ahead_by: 2, agentsChanged: name === 'AGENTS.md',
+        licenseChanged: name === 'LICENSE', drift: true,
+      });
+    }
+  }
+});
+
+test('ahead alone and file changes without ahead do not fail strict checks', async () => {
+  const dir = await fixture({ upstream: UPSTREAM });
+  for (const [ahead, files] of [
+    [0, []], [5, [{ filename: 'README.md' }, { filename: 'docs/AGENTS.md' }]],
+    [0, [{ filename: 'LICENSE' }]],
+  ]) {
+    const out = sink();
+    assert.equal(await main(['--upstream', '--fail-on-drift', '--json', dir], out, {
+      fetch: async () => compare(ahead, files),
+    }), 0);
+    assert.equal(JSON.parse(out.buf)[0].upstream.drift, false);
+  }
+});
+
+test('renaming either tracked upstream file counts as a change', async () => {
+  const r = await checkUpstream({ upstream: UPSTREAM, commit: COMMIT }, {
+    fetch: async () => compare(1, [
+      { filename: 'ARCHIVED.md', previous_filename: 'AGENTS.md' },
+      { filename: 'LICENSE', previous_filename: 'OLD-LICENSE' },
+    ]),
+  });
+  assert.equal(r.agentsChanged, true);
+  assert.equal(r.licenseChanged, true);
+  assert.equal(r.drift, true);
+});
+
+test('HTTP and network failures are unverifiable, failing only in strict mode', async () => {
+  const dir = await fixture({ upstream: UPSTREAM });
+  for (const reason of ['404', '401', '403', '500', 'network']) {
+    const fetch = async () => {
+      if (reason === 'network') throw new Error('synthetic connection error');
+      return { ok: false, status: Number(reason) };
+    };
+    for (const strict of [false, true]) {
+      for (const json of [false, true]) {
+        const out = sink();
+        const args = ['--upstream', ...(strict ? ['--fail-on-drift'] : []), ...(json ? ['--json'] : []), dir];
+        assert.equal(await main(args, out, { fetch }), strict ? 1 : 0);
+        if (json) {
+          const [r] = JSON.parse(out.buf);
+          assert.equal(r.ok, !strict);
+          assert.deepEqual(r.upstream, { status: 'unverifiable', reason });
+        } else assert.ok(out.buf.includes(`upstream: unverifiable (${reason})`));
+      }
+    }
+  }
+});
+
+test('GITHUB_TOKEN is sent in the header and never appears in text or JSON output', async (t) => {
+  const token = 'synthetic-test-token-never-a-real-credential';
+  const oldToken = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = token;
+  t.after(() => {
+    if (oldToken === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = oldToken;
+  });
+  const dir = await fixture({ upstream: UPSTREAM });
+  for (const outcome of ['success', 'http', 'network', 'json']) {
+    const requests = [];
+    const fetch = async (url, options) => {
+      requests.push({ url, options });
+      if (outcome === 'network') throw new Error(`synthetic failure ${token}`);
+      if (outcome === 'http') return { ok: false, status: 401, statusText: token, json: async () => ({ message: token }) };
+      if (outcome === 'json') return { ok: true, json: async () => { throw new Error(token); } };
+      return { ok: true, json: async () => ({ ahead_by: 1, files: [{ filename: 'AGENTS.md', patch: token }], message: token }) };
+    };
+    for (const json of [false, true]) {
+      const out = sink();
+      await main(['--upstream', ...(json ? ['--json'] : []), dir], out, { fetch });
+      assert.ok(!out.buf.includes(token));
+    }
+    assert.equal(requests.length, 2);
+    for (const { url, options } of requests) {
+      assert.equal(options.headers.Authorization, `Bearer ${token}`);
+      assert.ok(!url.includes(token));
+    }
+  }
+});
+
+test('no Authorization header is sent without an optional token', async () => {
+  let called = false;
+  const r = await checkUpstream({ upstream: `${UPSTREAM}.git/`, commit: COMMIT }, {
+    token: '', fetch: async (url, options) => {
+      called = true;
+      assert.equal(url, `https://api.github.com/repos/synthetic-owner/synthetic-rules/compare/${COMMIT}...main`);
+      assert.equal(Object.hasOwn(options.headers, 'Authorization'), false);
+      return compare();
+    },
+  });
+  assert.equal(called, true);
+  assert.equal(r.status, 'verified');
+});
+
+test('unsupported or credential-bearing upstream URLs never cause a request', async () => {
+  for (const upstream of [
+    undefined, 'invalid', 'https://example.invalid/owner/repo',
+    'https://github.com.example.invalid/owner/repo', 'http://github.com/owner/repo',
+    'https://synthetic-token@github.com/owner/repo', 'https://github.com:8443/owner/repo',
+    `${UPSTREAM}/tree/main`, `${UPSTREAM}?token=synthetic`, `${UPSTREAM}#fragment`,
+  ]) {
+    const r = await checkUpstream({ upstream, commit: COMMIT });
+    assert.deepEqual(r, { status: 'unverifiable', reason: 'invalid metadata' });
+  }
+  assert.equal(globalThis.fetch.mock.callCount(), 0);
+});
+
+test('invalid pin or missing provenance yields unverifiable upstream without fetch', async () => {
+  const dir = await fixture({ upstream: UPSTREAM, commit: 'invalid' });
+  const invalid = await checkRepo(dir, { upstream: true });
+  assert.equal(invalid.ok, false);
+  assert.equal(invalid.upstream.reason, 'invalid metadata');
+  const absent = await checkRepo(join(dir, 'missing'), { upstream: true });
+  assert.equal(absent.upstream.reason, 'invalid metadata');
+  assert.equal(globalThis.fetch.mock.callCount(), 0);
+});
+
+test('malformed and capped compare responses are unverifiable', async () => {
+  const cases = [
+    [null, 'invalid response'], [{}, 'invalid response'],
+    [{ ahead_by: '1', files: [] }, 'invalid response'],
+    [{ ahead_by: -1, files: [] }, 'invalid response'],
+    [{ ahead_by: 1 }, 'invalid response'],
+    [{ ahead_by: 1, files: [null] }, 'invalid response'],
+    [{ ahead_by: 1, files: [{ filename: 'AGENTS.md', previous_filename: 123 }] }, 'invalid response'],
+    [{ ahead_by: 1, files: Array.from({ length: 300 }, (_, i) => ({ filename: `synthetic-${i}.md` })) }, 'file list limit'],
+  ];
+  for (const [body, reason] of cases) {
+    const r = await checkUpstream({ upstream: UPSTREAM, commit: COMMIT }, {
+      fetch: async () => ({ ok: true, json: async () => body }),
+    });
+    assert.deepEqual(r, { status: 'unverifiable', reason });
+  }
+});
+
+test('upstream checks each repo, honors --vendor-dir, and preserves local pin failures', async () => {
+  const vendorDir = 'custom-vendor/rules';
+  const clean = await fixture({ upstream: UPSTREAM, vendorDir });
+  const otherUpstream = 'https://github.com/another-synthetic-owner/rules';
+  const otherCommit = 'b'.repeat(40);
+  const dirty = await fixture({
+    upstream: otherUpstream, commit: otherCommit, vendorDir, license: 'edited\n', recordLicense: 'original\n',
+  });
+  const calls = [];
+  const out = sink();
+  const code = await main(['--json', '--upstream', '--vendor-dir', vendorDir, clean, dirty], out, {
+    fetch: async (url) => { calls.push(url); return compare(); },
+  });
+  assert.equal(code, 1);
+  assert.deepEqual(calls, [
+    `https://api.github.com/repos/synthetic-owner/synthetic-rules/compare/${COMMIT}...main`,
+    `https://api.github.com/repos/another-synthetic-owner/rules/compare/${otherCommit}...main`,
+  ]);
+  const results = JSON.parse(out.buf);
+  assert.equal(results[0].ok, true);
+  assert.equal(results[1].ok, false);
+  assert.ok(results[1].problems.some((p) => p.startsWith('LICENSE: sha256')));
+  assert.ok(results.every((r) => r.upstream.status === 'verified'));
+});
+
+test('--fail-on-drift requires explicit --upstream and help describes both', async () => {
+  const out = sink();
+  assert.equal(await main(['--fail-on-drift'], out), 2);
+  assert.match(out.buf, /requires --upstream/);
+  const help = sink();
+  assert.equal(await main(['--help'], help), 0);
+  assert.match(help.buf, /--upstream/);
+  assert.match(help.buf, /--fail-on-drift/);
+  assert.equal(globalThis.fetch.mock.callCount(), 0);
 });

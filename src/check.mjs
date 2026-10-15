@@ -2,6 +2,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { parseProvenance } from './provenance.mjs';
+import { checkUpstream } from './upstream.mjs';
 
 export const DEFAULT_VENDOR_DIR = 'vendor/ai-agent-rules';
 
@@ -16,14 +17,25 @@ async function measure(file) {
 
 /**
  * Check one repository directory. Read-only.
- * Returns { dir, ok, commit, problems: string[] }.
+ * Returns { dir, ok, commit, problems: string[], upstream? }.
  */
-export async function checkRepo(dir, { vendorDir = DEFAULT_VENDOR_DIR } = {}) {
+export async function checkRepo(dir, {
+  vendorDir = DEFAULT_VENDOR_DIR, upstream = false, failOnDrift = false, fetch, token,
+} = {}) {
+  async function finish(result, fields = {}) {
+    if (upstream) {
+      result.upstream = await checkUpstream(fields, { fetch, token });
+      if (failOnDrift && (result.upstream.status === 'unverifiable' || result.upstream.drift)) {
+        result.ok = false;
+      }
+    }
+    return result;
+  }
   const base = join(dir, vendorDir);
   const problems = [];
   const provPath = join(base, 'PROVENANCE.md');
   if (!(await exists(provPath))) {
-    return { dir, ok: false, commit: null, problems: [`missing ${vendorDir}/PROVENANCE.md`] };
+    return finish({ dir, ok: false, commit: null, problems: [`missing ${vendorDir}/PROVENANCE.md`] });
   }
   const { fields, missing } = parseProvenance(await readFile(provPath, 'utf8'));
   for (const k of missing) problems.push(`PROVENANCE.md: field "${k}" missing or malformed`);
@@ -43,5 +55,5 @@ export async function checkRepo(dir, { vendorDir = DEFAULT_VENDOR_DIR } = {}) {
       problems.push(`${name}: sha256 ${got.sha256} != recorded ${wantSha}`);
     }
   }
-  return { dir, ok: problems.length === 0, commit: fields.commit ?? null, problems };
+  return finish({ dir, ok: problems.length === 0, commit: fields.commit ?? null, problems }, fields);
 }
