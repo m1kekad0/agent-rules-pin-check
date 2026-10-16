@@ -1,3 +1,5 @@
+> **移行済み / Moved**: このリポジトリは archive されています。pin 検査は [m1kekad0/ai-agent-rules](https://github.com/m1kekad0/ai-agent-rules) の `scripts/check-pin.mjs` に統合されました（ai-agent-rules PR #16）。
+
 # agent-rules-pin-check
 
 vendored された [ai-agent-rules](https://github.com/m1kekad0/ai-agent-rules) の固定コピーが、`PROVENANCE.md` に記録したバイト数・SHA256 と一致しているかを確かめる、依存ゼロの小さな Node.js CLI です。AI エージェント駆動の開発で、共通ルールの pin が壊れていないかを PR ごとに機械的に確認する用途を想定しています。
